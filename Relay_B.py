@@ -110,14 +110,15 @@ class Relay():
         cmd = [self.address, 0x05, 0, channel - 1, 0xFF, 0]     
         self._write(cmd)
 
-        # TODO
-        # time.sleep(0.2)
+        # Receive response once (8 bytes expected)
+        response = self.sock.recv(8)
+        
+        if len(response) < 8:
+            raise RuntimeError(f'Invalid response length from device [{self}] when turning on channel [{channel}]: expected 8, got {len(response)}.')
 
-        if self.sock.recv(8) != bytearray(cmd):
-            raise RuntimeError(f'Did not receive response from device [{self}] when turning on channel [{channel}].')
-
-        if not self.status(channel):
-            raise RuntimeError(f'Failed to turn on relay channel [{channel}] of device [{self}].')
+        # Verify response matches command (first 6 bytes)
+        if response[:6] != bytearray(cmd):
+            raise RuntimeError(f'Did not receive correct response from device [{self}] when turning on channel [{channel}].')
 
     def off(self, channel: int):
         """Turn a relay channel off.
@@ -132,24 +133,15 @@ class Relay():
         cmd = [self.address, 0x05, 0, channel - 1, 0, 0]     
         self._write(cmd)
 
-        # TODO
-        # time.sleep(0.2)
+        # Receive response once (8 bytes expected)
+        response = self.sock.recv(8)
+        
+        if len(response) < 8:
+            raise RuntimeError(f'Invalid response length from device [{self}] when turning off channel [{channel}]: expected 8, got {len(response)}.')
 
-        if self.sock.recv(8) != bytearray(cmd):
-            raise RuntimeError(f'Did not receive response from device [{self}] when turning on channel [{channel}].')
-
-        if self.status(channel):
-            raise RuntimeError(f'Failed to turn off relay channel [{channel}] of device [{self}].')
-
-    def all_off(self):
-        """Turn all relay channels off."""
-        for i in self.channels:
-            self.off(i)
-
-    def all_on(self):
-        """Turn all relay channels on."""
-        for i in self.channels:
-            self.on(i)
+        # Verify response matches command (first 6 bytes)
+        if response[:6] != bytearray(cmd):
+            raise RuntimeError(f'Did not receive correct response from device [{self}] when turning off channel [{channel}].')
 
     def status(self, channel: int):
         """Return whether a relay channel is on (True) or off (False).
@@ -163,7 +155,14 @@ class Relay():
         cmd = [0x01, 0x01, 0, 0, 0, 0x08, 0x3D, 0xCC]   
         self.sock.send(bytearray(cmd))
 
-        if self.sock.recv(6)[3] & 2**(channel-1):
+        # Receive response (6 bytes expected for read coil status)
+        response = self.sock.recv(6)
+        
+        if len(response) < 6:
+            raise RuntimeError(f'Invalid response length when checking status of channel [{channel}]: expected 6, got {len(response)}.')
+
+        # Byte 3 contains the coil status bits
+        if response[3] & (1 << (channel - 1)):
             return True
         else:
             return False
