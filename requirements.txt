@@ -1,0 +1,21 @@
+# AGC LOGO MARK - Requirements
+# For Jetson Orin Nano with JetPack SDK (CUDA pre-installed)
+#
+# NOTE for Jetson Orin Nano:
+# - PyTorch comes pre-installed with JetPack SDK (with CUDA support)
+# - Do NOT install torch from PyPI on Jetson; use the NVIDIA-provided wheel
+# - Install PyTorch for Jetson from: https://forums.developer.nvidia.com/t/pytorch-for-jetson/
+#
+# Install steps on Jetson:
+#   1. Flash JetPack 6.x (includes CUDA, cuDNN, TensorRT)
+#   2. pip3 install --upgrade pip
+#   3. Install PyTorch for Jetson (provided by NVIDIA)
+#   4. pip3 install -r requirements.txt
+#
+# On desktop (Windows/Linux) for development:
+#   pip install -r requirements.txt
+
+PySide6>=6.5.0
+easyocr>=1.7.0
+opencv-python>=4.8.0
+numpy>=1.24.0
