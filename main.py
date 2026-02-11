@@ -268,12 +268,12 @@ QCheckBox::indicator:checked {
 # ──────────────────────────────────────────────────────────────
 class RelayWorker(QThread):
     """Monitors relay board DI signals in a background thread."""
-    di1_triggered = Signal()   # (unused)
-    di2_triggered = Signal()   # OCR trigger
+    di1_triggered = Signal()
+    di2_triggered = Signal()
     relay_connected = Signal(bool)
     relay_error = Signal(str)
 
-    def __init__(self, host="192.168.1.200", port=502):
+    def __init__(self, host="192.168.1.254", port=502):
         super().__init__()
         self.host = host
         self.port = port
@@ -281,63 +281,135 @@ class RelayWorker(QThread):
         self._relay = None
         self._prev_di1 = False
         self._prev_di2 = False
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 3
 
     def run(self):
         self._running = True
+        self._attempt_connection()
+
+        while self._running:
+            try:
+                if self._relay is None:
+                    self._attempt_connection()
+                else:
+                    di1 = self._relay.is_DI_on(1)
+                    di2 = self._relay.is_DI_on(2)
+
+                    if di2 and not self._prev_di2:
+                        self.di2_triggered.emit()
+                        logger.info("DI2 triggered - OCR start")
+
+                    self._prev_di1 = di1
+                    self._prev_di2 = di2
+            except Exception as e:
+                self.relay_error.emit(str(e))
+                logger.error(f"Relay read error: {e}")
+                self._relay = None  # force reconnect on next loop
+
+            self.msleep(100)
+
+        self._close_relay()
+
+    def _attempt_connection(self):
+        """Attempt to connect with retry logic."""
         try:
             from Relay_B import Relay
             self._relay = Relay(host=self.host, port=self.port)
             self._relay.connect()
             self.relay_connected.emit(True)
+            self._reconnect_attempts = 0
             logger.info(f"Relay connected at {self.host}:{self.port}")
         except Exception as e:
-            self.relay_error.emit(str(e))
-            self.relay_connected.emit(False)
-            logger.warning(f"Relay connection failed: {e}")
-            self._running = False
-            return
+            self._reconnect_attempts += 1
+            error_msg = f"Relay connection failed (attempt {self._reconnect_attempts}): {e}"
+            self.relay_error.emit(error_msg)
+            logger.warning(error_msg)
+            if self._reconnect_attempts >= self._max_reconnect_attempts:
+                self.relay_connected.emit(False)
+                self._relay = None
 
-        while self._running:
-            try:
-                di1 = self._relay.is_DI_on(1)
-                di2 = self._relay.is_DI_on(2)
-
-                # Rising edge detection
-                if di2 and not self._prev_di2:
-                    self.di2_triggered.emit()
-                    logger.info("DI2 triggered - OCR start")
-
-                self._prev_di1 = di1
-                self._prev_di2 = di2
-            except Exception as e:
-                self.relay_error.emit(str(e))
-                logger.error(f"Relay read error: {e}")
-
-            self.msleep(100)
-
+    def _close_relay(self):
+        """Safely close relay connection."""
         if self._relay:
             try:
                 self._relay.disconnect()
-            except Exception:
-                pass
-
-    def stop(self):
-        self._running = False
-        self.wait(2000)
+            except Exception as e:
+                logger.warning(f"Error closing relay: {e}")
+            self._relay = None
 
     def turn_on_relay(self, channel: int):
         if self._relay:
             try:
                 self._relay.on(channel)
+                logger.info(f"Relay CH{channel} ON")
             except Exception as e:
-                self.relay_error.emit(str(e))
+                error_msg = f"Failed to turn ON relay CH{channel}: {e}"
+                self.relay_error.emit(error_msg)
+                logger.error(error_msg)
+                self._relay = None  # force reconnect
 
     def turn_off_relay(self, channel: int):
         if self._relay:
             try:
                 self._relay.off(channel)
+                logger.info(f"Relay CH{channel} OFF")
             except Exception as e:
-                self.relay_error.emit(str(e))
+                error_msg = f"Failed to turn OFF relay CH{channel}: {e}"
+                self.relay_error.emit(error_msg)
+                logger.error(error_msg)
+                self._relay = None  # force reconnect
+
+    def turn_all_relays_off(self):
+        """Turn off all relay channels (1-8)."""
+        if self._relay:
+            try:
+                for channel in range(1, 9):
+                    self._relay.off(channel)
+                logger.info("All relay channels turned OFF")
+            except Exception as e:
+                error_msg = f"Failed to turn off all relays: {e}"
+                self.relay_error.emit(error_msg)
+                logger.error(error_msg)
+                self._relay = None  # force reconnect
+
+    def reset_relays(self, channels: list):
+        """Turn off specific relay channels only if they are ON.
+        
+        Args:
+            channels: List of channel numbers to reset (e.g., [4, 5])
+        """
+        if not self._relay:
+            logger.warning("Relay not connected, cannot reset")
+            return
+            
+        for channel in channels:
+            try:
+                # Try to check status first
+                try:
+                    is_on = self._relay.status(channel)
+                    if is_on:
+                        self._relay.off(channel)
+                        logger.info(f"Relay CH{channel} was ON, turned OFF")
+                    else:
+                        logger.info(f"Relay CH{channel} already OFF, skipping")
+                except Exception as status_error:
+                    # Status check failed, try turning off anyway
+                    logger.warning(f"Could not check status of CH{channel}, attempting turn off: {status_error}")
+                    try:
+                        self._relay.off(channel)
+                        logger.info(f"Relay CH{channel} turned OFF (status check failed)")
+                    except Exception as off_error:
+                        logger.error(f"Failed to turn OFF relay CH{channel}: {off_error}")
+            except Exception as e:
+                logger.error(f"Error resetting relay CH{channel}: {e}")
+                # Do NOT set self._relay = None here - keep connection alive
+                # The monitoring loop will handle reconnection if needed
+
+    def stop(self):
+        self._running = False
+        self.wait(2000)
+
 
 
 # ──────────────────────────────────────────────────────────────
@@ -557,7 +629,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1280, 800)
         self.setStyleSheet(DARK_STYLESHEET)
         self.setWindowIcon(QIcon(str(Path(__file__).parent / "logo.ico")))
-
+        # Set fullscreen on startup
+        self.showFullScreen()
         # State
         self._app_dir = Path(__file__).parent
         self._current_job_file: Optional[str] = None
@@ -591,6 +664,9 @@ class MainWindow(QMainWindow):
         self._log_timer = QTimer(self)
         self._log_timer.timeout.connect(self._refresh_log)
         self._log_timer.start(1000)
+
+        # Auto-connect relay after 10 seconds
+        QTimer.singleShot(10000, self._auto_connect_relay)
 
         logger.info("Application started")
         self.statusBar().showMessage("Ready  |  Camera initializing...")
@@ -716,7 +792,9 @@ class MainWindow(QMainWindow):
 
         btn_reset_rot = QPushButton("Reset")
         btn_reset_rot.setMaximumWidth(100)
-        btn_reset_rot.clicked.connect(lambda: self.rotation_slider.setValue(0))
+        # Turn relay 4 and 5 to off
+        btn_reset_rot.clicked.connect(lambda: self.relay_worker.reset_relays([4, 5]))
+        btn_reset_rot.clicked.connect(self._stop_inspection)
         ctrl_layout.addWidget(btn_reset_rot)
 
         left_panel.addLayout(ctrl_layout)
@@ -860,7 +938,7 @@ class MainWindow(QMainWindow):
         relay_layout = QFormLayout(relay_group)
         relay_layout.setSpacing(10)
 
-        self.relay_host_input = QLineEdit("192.168.1.200")
+        self.relay_host_input = QLineEdit("192.168.1.254")
         relay_layout.addRow("Relay IP:", self.relay_host_input)
 
         self.relay_port_spin = QSpinBox()
@@ -1113,31 +1191,34 @@ class MainWindow(QMainWindow):
                 best_match = ""
                 status = "NOT FOUND"
                 status_color = QColor("#f38ba8")  # red
+                similarity = 0
 
                 for det in detected_texts:
+                    # Exact match
                     if expected_upper == det:
-                        # Exact match
                         best_match = det
                         status = "MATCH"
                         status_color = QColor("#a6e3a1")  # green
                         match_count += 1
+                        similarity = 100
                         break
-                    elif expected_upper in det or det in expected_upper:
-                        # Substring match (partial) - treat as MATCH
-                        best_match = det
-                        status = "MATCH"
-                        status_color = QColor("#a6e3a1")  # green
-                        match_count += 1
-                        break
-
-                # If no single text matched, check by combining all detected texts
-                if status == "NOT FOUND" and detected_texts:
-                    combined = " ".join(detected_texts)
-                    if expected_upper in combined:
-                        best_match = combined
-                        status = "MATCH"
-                        status_color = QColor("#a6e3a1")  # green
-                        match_count += 1
+                    else:
+                        # Calculate similarity using SequenceMatcher
+                        from difflib import SequenceMatcher
+                        ratio = SequenceMatcher(None, expected_upper, det).ratio()
+                        sim_percent = int(ratio * 100)
+                        
+                        # Partial match: 70-100% similarity
+                        if 70 <= sim_percent < 100:
+                            if sim_percent > similarity:
+                                best_match = det
+                                status = "PARTIAL"
+                                status_color = QColor("#f9e2af")  # yellow/orange
+                                partial_count += 1
+                                similarity = sim_percent
+                        elif sim_percent > similarity and sim_percent >= 70:
+                            best_match = det
+                            similarity = sim_percent
 
                 item_detected = QTableWidgetItem(best_match)
                 item_detected.setFlags(
@@ -1145,7 +1226,15 @@ class MainWindow(QMainWindow):
                 )
                 self.results_table.setItem(row, 1, item_detected)
 
-                item_status = QTableWidgetItem(status)
+                # Add similarity percentage to status
+                if status == "PARTIAL":
+                    status_text = f"PARTIAL ({similarity}%)"
+                elif status == "MATCH":
+                    status_text = "MATCH"
+                else:
+                    status_text = "NOT FOUND"
+
+                item_status = QTableWidgetItem(status_text)
                 item_status.setFlags(
                     item_status.flags() & ~Qt.ItemIsEditable
                 )
@@ -1165,7 +1254,7 @@ class MainWindow(QMainWindow):
             self.summary_label.setText(
                 f"Total: {total}  |  "
                 f"<span style='color:#a6e3a1;'>Match: {match_count}</span>  |  "
-                f"<span style='color:#f9e2af;'>Partial: {partial_count}</span>  |  "
+                f"<span style='color:#f9e2af;'>Partial (70-100%): {partial_count}</span>  |  "
                 f"<span style='color:#f38ba8;'>Not Found: {not_found}</span>\n\n"
                 f"Detected texts: {', '.join(detected_texts) if detected_texts else 'None'}"
             )
@@ -1174,18 +1263,19 @@ class MainWindow(QMainWindow):
 
             # Pass/Fail relay control
             if self._relay_connected and self.relay_worker:
-                if not_found == 0:
-                    # All matched - Relay ch4 ON, ch5 OFF
-                    self.relay_worker.turn_on_relay(4)
-                    self.relay_worker.turn_off_relay(5)
-                    logger.info("All matched - Relay CH4 ON, CH5 OFF")
-                    # Auto-stop after 5 seconds
-                    QTimer.singleShot(5000, self._stop_inspection)
-                else:
-                    # Not all matched - Relay ch5 ON, ch4 OFF
-                    self.relay_worker.turn_on_relay(5)
-                    self.relay_worker.turn_off_relay(4)
-                    logger.info("Not all matched - Relay CH5 ON, CH4 OFF")
+                try:
+                    if not_found == 0:
+                        # All matched - Relay ch4 ON, ch5 OFF
+                        self.relay_worker.turn_on_relay(4)
+                        logger.info("All matched - Relay CH4 ON, CH5 OFF")
+                        # Auto-stop after 5 seconds
+                        QTimer.singleShot(5000, self._stop_inspection)
+                    else:
+                        # Not all matched - Relay ch5 ON, ch4 OFF
+                        self.relay_worker.turn_on_relay(5)
+                        logger.info("Not all matched - Relay CH5 ON, CH4 OFF")
+                except Exception as e:
+                    logger.error(f"Relay control error: {e}")
         else:
             # No model loaded - just show all detected texts
             self.results_table.setRowCount(len(results))
@@ -1559,10 +1649,19 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Relay disconnected")
         logger.info("Relay disconnected")
 
+    def _auto_connect_relay(self):
+        """Auto-connect to relay after app startup."""
+        host = self.relay_host_input.text().strip()
+        port = self.relay_port_spin.value()
+        logger.info(f"Auto-connecting to relay at {host}:{port}...")
+        self._connect_relay()
+
     @Slot(bool)
     def _on_relay_connected(self, connected: bool):
         self._relay_connected = connected
         if connected:
+            # Check relay status then turn all relay off
+            #self.relay_worker.turn_all_relays_off()
             self.relay_indicator.setText("  RELAY: Connected  ")
             self.relay_indicator.setObjectName("statusOn")
             self.btn_connect_relay.setEnabled(False)
@@ -1674,6 +1773,8 @@ def main():
 
     window = MainWindow()
     window.show()
+
+
 
     sys.exit(app.exec())
 
