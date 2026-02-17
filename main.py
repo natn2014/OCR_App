@@ -1587,6 +1587,8 @@ class MainWindow(QMainWindow):
         dialog = AddJobDialog(self)
         if dialog.exec() == QDialog.Accepted:
             name, texts = dialog.get_data()
+            # Clean job name using clean_raw_text
+            name = self.clean_raw_text(name)
             if not name:
                 QMessageBox.warning(self, "Warning", "Please enter a job name.")
                 return
@@ -1781,3 +1783,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
