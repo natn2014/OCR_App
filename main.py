@@ -1326,24 +1326,62 @@ class MainWindow(QMainWindow):
     def clean_raw_text(self, raw_text):
         """Clean raw text by removing prefix before and including first '$',
         and removing suffix from second '$' onwards.
+        Also removes '%' and everything after it.
+        Also decodes barcode scanner escape sequences.
         Example: FOD11850100163$1SRG14R(BRK)-MM-4FIMXA-A7$15 -> SRG14R(BRK)-MM-4FIMXA-A7
         """
         raw_text = raw_text.strip()
 
+        # Barcode scanner escape sequence mapping (ASCII escape encoding)
+        # Maps scanner escape codes to actual characters
+        barcode_escape_map = {
+            '/H': '(',      # Left parenthesis
+            '/I': ')',      # Right parenthesis
+            '/J': '+',      # Plus
+            '/K': ',',      # Comma
+            '/L': '-',      # Minus/Hyphen
+            '/M': '.',      # Period
+            '/N': '/',      # Forward slash
+            '/O': ':',      # Colon
+            '/P': ';',      # Semicolon
+            '/Q': '<',      # Less than
+            '/R': '=',      # Equals
+            '/S': '>',      # Greater than
+            '/T': '?',      # Question mark
+            '/U': '@',      # At sign
+            '/V': '[',      # Left bracket
+            '/W': '\\',     # Backslash
+            '/X': ']',      # Right bracket
+            '/Y': '^',      # Caret
+            '/Z': '_',      # Underscore
+        }
+
+        # Decode barcode scanner escape sequences
+        for escape_code, actual_char in barcode_escape_map.items():
+            raw_text = raw_text.replace(escape_code, actual_char)
+
         # Find first '$'
         first_dollar = raw_text.find('$')
         if first_dollar == -1:
-            return raw_text  # No '$' found, return as is
+            result = raw_text  # No '$' found, return as is
+        else:
+            # Remove everything up to and including first '$'
+            text_after_first = raw_text[first_dollar + 1:]
 
-        # Remove everything up to and including first '$'
-        text_after_first = raw_text[first_dollar + 1:]
+            # Find second '$'
+            second_dollar = text_after_first.find('$')
+            if second_dollar == -1:
+                result = text_after_first  # No second '$', return everything after first
+            else:
+                # Return text between first and second '$'
+                result = text_after_first[:second_dollar]
 
-        # Find second '$'
-        second_dollar = text_after_first.find('$')
-        if second_dollar == -1:
-            return text_after_first  # No second '$', return everything after first
+        # Remove '%' and everything after it
+        percent_pos = result.find('%')
+        if percent_pos != -1:
+            result = result[:percent_pos]
 
-        # Return text between first and second '$'
+        return result
         return text_after_first[:second_dollar]
 
     def _load_model_file(self):
@@ -1592,12 +1630,11 @@ class MainWindow(QMainWindow):
             if not name:
                 QMessageBox.warning(self, "Warning", "Please enter a job name.")
                 return
+            
+            # If no texts provided, use the cleaned job name as a detection text
             if not texts:
-                QMessageBox.warning(
-                    self, "Warning", "Please enter at least one text pattern."
-                )
-                return
-
+                texts = [name]
+            
             filepath = self._app_dir / f"{name}.json"
             if filepath.exists():
                 reply = QMessageBox.question(
@@ -1783,4 +1820,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
