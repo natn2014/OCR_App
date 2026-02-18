@@ -424,9 +424,10 @@ class OCRWorker(QThread):
     def __init__(self, languages=None, use_gpu=True):
         super().__init__()
         self._frame = None
+        self._frame_counter = 0  # Track frame updates
+        self._last_processed_counter = -1  # Track last processed frame
         self._running = False
         self._mutex = QMutex()
-        self._process_requested = False
         self._reader = None
         self._languages = languages or ["en"]
         self._use_gpu = use_gpu
@@ -460,10 +461,10 @@ class OCRWorker(QThread):
         self._rotation_angle = angle
 
     def request_process(self, frame: np.ndarray):
-        """Queue a frame for OCR processing."""
+        """Update frame buffer with latest camera frame."""
         with QMutexLocker(self._mutex):
             self._frame = frame.copy()
-            self._process_requested = True
+            self._frame_counter += 1  # Increment to signal new frame available
 
     def run(self):
         self._running = True
@@ -472,11 +473,13 @@ class OCRWorker(QThread):
         while self._running:
             process = False
             frame = None
+            current_counter = -1
 
             with QMutexLocker(self._mutex):
-                if self._process_requested and self._frame is not None:
+                # Process if new frame is available (counter changed)
+                if self._frame_counter > self._last_processed_counter and self._frame is not None:
                     frame = self._frame.copy()
-                    self._process_requested = False
+                    current_counter = self._frame_counter
                     process = True
 
             if process and self._reader is not None and frame is not None:
@@ -550,6 +553,11 @@ class OCRWorker(QThread):
 
                     self.ocr_result.emit(results, annotated)
                     logger.info(f"OCR detected {len(results)} text regions")
+                    
+                    # Mark this frame as processed
+                    with QMutexLocker(self._mutex):
+                        self._last_processed_counter = current_counter
+                        
                 except Exception as e:
                     self.ocr_error.emit(str(e))
                     logger.error(f"OCR processing error: {e}")
@@ -645,6 +653,8 @@ class MainWindow(QMainWindow):
         self._continuous_ocr = False
         self._frame_paused = False
         self._frozen_frame = None
+        self._ocr_processing = False  # Track if OCR is actually processing
+        self._last_ocr_result_time = 0  # Track last OCR result timestamp
 
         # Log buffer for Log tab
         self._log_handler = LogHandler()
@@ -664,6 +674,11 @@ class MainWindow(QMainWindow):
         self._log_timer = QTimer(self)
         self._log_timer.timeout.connect(self._refresh_log)
         self._log_timer.start(1000)
+
+        # OCR monitoring timer (check if continuous OCR is active but not processing)
+        self._ocr_monitor_timer = QTimer(self)
+        self._ocr_monitor_timer.timeout.connect(self._monitor_ocr_processing)
+        self._ocr_monitor_timer.start(2000)  # Check every 2 seconds
 
         # Auto-connect relay after 10 seconds
         QTimer.singleShot(10000, self._auto_connect_relay)
@@ -1144,6 +1159,7 @@ class MainWindow(QMainWindow):
         self._continuous_ocr = checked
         if checked:
             self._is_inspecting = True
+            self._last_ocr_result_time = time.time()  # Reset result time tracker
             self.btn_stop.setEnabled(True)
             self.statusBar().showMessage("Continuous OCR mode active")
             logger.info("Continuous OCR enabled")
@@ -1152,11 +1168,59 @@ class MainWindow(QMainWindow):
             self.btn_trigger.setEnabled(True)
             self.btn_stop.setEnabled(False)
 
+    @Slot()
+    def _on_di2_triggered(self):
+        """Handle DI2 trigger from relay - start continuous OCR."""
+        # Check if model is loaded - if not, turn off relays and abort
+        if not self._model_data:
+            logger.warning("DI2 triggered but no job model loaded - turning off relays")
+            if self._relay_connected and self.relay_worker:
+                self.relay_worker.turn_off_relay(4)
+                self.relay_worker.turn_off_relay(5)
+            self.statusBar().showMessage("DI2 triggered but no job model loaded")
+            return
+
+        self._continuous_ocr = True
+        self._is_inspecting = True
+        self._frame_paused = False
+        self._frozen_frame = None
+        self._last_ocr_result_time = time.time()  # Reset result time tracker
+        self.btn_continuous.setChecked(True)
+        self.btn_stop.setEnabled(True)
+        self.btn_trigger.setEnabled(False)
+        self.statusBar().showMessage("DI2 triggered - Continuous OCR mode active")
+        logger.info("DI2 triggered - Continuous OCR started")
+
+    def _monitor_ocr_processing(self):
+        """Monitor if continuous OCR is active but not processing - turn off relays if so."""
+        if not self._continuous_ocr or not self._relay_connected or not self.relay_worker:
+            return
+
+        # Check if OCR results are coming in
+        current_time = time.time()
+        time_since_last_result = current_time - self._last_ocr_result_time
+
+        # If continuous OCR is on but no results for 5 seconds, turn off relays
+        if time_since_last_result > 5.0:
+            logger.warning(
+                f"DI2 active but no OCR results for {time_since_last_result:.1f}s - "
+                "turning off relays"
+            )
+            self.relay_worker.turn_off_relay(4)
+            self.relay_worker.turn_off_relay(5)
+            self._continuous_ocr = False
+            self._is_inspecting = False
+            self.btn_continuous.setChecked(False)
+            self.btn_stop.setEnabled(False)
+            self.btn_trigger.setEnabled(True)
+            self.statusBar().showMessage("OCR processing timeout - DI2 relays turned off")
+
     # ── OCR Result Handling ──────────────────────────────────
     @Slot(list, object)
     def _on_ocr_result(self, results: list, annotated_frame):
         """Handle OCR results from worker thread."""
         self._ocr_results = results
+        self._last_ocr_result_time = time.time()  # Update last result time
 
         # Display annotated frame (keep paused to show results)
         if annotated_frame is not None:
@@ -1268,8 +1332,8 @@ class MainWindow(QMainWindow):
                         # All matched - Relay ch4 ON, ch5 OFF
                         self.relay_worker.turn_on_relay(4)
                         logger.info("All matched - Relay CH4 ON, CH5 OFF")
-                        # Auto-stop after 5 seconds
-                        QTimer.singleShot(5000, self._stop_inspection)
+                        # Auto-stop after 1 seconds
+                        QTimer.singleShot(1000, self._stop_inspection)
                     else:
                         # Not all matched - Relay ch5 ON, ch4 OFF
                         self.relay_worker.turn_on_relay(5)
@@ -1327,6 +1391,7 @@ class MainWindow(QMainWindow):
         """Clean raw text by removing prefix before and including first '$',
         and removing suffix from second '$' onwards.
         Also removes '%' and everything after it.
+        Also removes '/D' and everything after it.
         Also decodes barcode scanner escape sequences.
         Example: FOD11850100163$1SRG14R(BRK)-MM-4FIMXA-A7$15 -> SRG14R(BRK)-MM-4FIMXA-A7
         """
@@ -1381,8 +1446,12 @@ class MainWindow(QMainWindow):
         if percent_pos != -1:
             result = result[:percent_pos]
 
+        # Remove '/D' and everything after it
+        slash_d_pos = result.find('/D')
+        if slash_d_pos != -1:
+            result = result[:slash_d_pos]
+
         return result
-        return text_after_first[:second_dollar]
 
     def _load_model_file(self):
         """Show a text input dialog to search for a .json job by name."""
@@ -1669,7 +1738,7 @@ class MainWindow(QMainWindow):
         self.relay_worker = RelayWorker(host=host, port=port)
         self.relay_worker.relay_connected.connect(self._on_relay_connected)
         self.relay_worker.relay_error.connect(self._on_relay_error)
-        self.relay_worker.di2_triggered.connect(self._trigger_ocr)
+        self.relay_worker.di2_triggered.connect(self._on_di2_triggered)
         self.relay_worker.start()
         self.statusBar().showMessage(f"Connecting to relay at {host}:{port}...")
 
@@ -1756,6 +1825,7 @@ class MainWindow(QMainWindow):
 
         self._timer.stop()
         self._log_timer.stop()
+        self._ocr_monitor_timer.stop()
 
         if self._capture is not None:
             self._capture.release()
